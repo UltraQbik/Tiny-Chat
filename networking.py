@@ -1,242 +1,238 @@
-import base64
 import json
-
-import rsa
+import base64
 import socket
 import threading as th
 
-from typing import Callable, Any
+from typing import Callable
 
 
 PORT = 13698
 
 BUFFER_SIZE = 2**14
-TRANSFER_END = b'\x11packet_transfer_end\x11'
+TRANSFER_DELIMITER = b'\x2c\xae\x47\x6b\x39\xaetransfer_end\x28\x41\x2c\xa3\xae\x2c'
 
-
-def is_connected(sock: socket.socket | None) -> bool:
-    if sock is None:
-        return False
-
-    try:
-        sock.getsockname()
-    except socket.error:
-        return False
-    return True
+RSA_KEY_SIZE = 1024 * 3
+AES_KEY_SIZE = 256
 
 
 class User:
-    def __init__(self, s: socket.socket | None = None, **kwargs):
-        self.socket: socket.socket | None = s
+    def __init__(self, **kwargs):
+        self.socket: socket.socket | None = None
+        self.sock: tuple[str, int] | None = None
+        self.peer: tuple[str, int] | None = None
 
-        self.sock: tuple[str, int] | None = self.socket.getsockname() if self.socket else None
-        try:
-            self.peer: tuple[str, int] | None = self.socket.getpeername() if self.socket else None
-        except socket.error:
-            self.peer: tuple[str, int] | None = ("0.0.0.0", PORT) if self.socket else None
-        self.username: str = "user_none"
+        self.nick: str = "user"
 
-        self.pub_key: rsa.PublicKey | None = None
+        self.rsa_pub_key: None = None
+        self.rsa_pri_key: None = None
         self.aes_key: None = None
+
+        self.rsa_size: int = 64
+        self.aes_size: int = 64
 
         for name, val in kwargs.items():
             setattr(self, name, val)
 
     def __copy__(self):
-        return User(**self.__dict__)
+        return type(self)(**self.__dict__)
+
+    def gen_new_rsa(self, size: int | None = None):
+        if size is None:
+            self.rsa_size = RSA_KEY_SIZE
+        else:
+            self.rsa_size = size
+
+    def gen_new_aes(self, size: int | None = None):
+        if size is None:
+            self.aes_size = AES_KEY_SIZE
+        else:
+            self.aes_size = size
+
+    def close(self):
+        Clients.close(self)
+
+    def assign_socket(self, sock: socket.socket, host: bool = False):
+        self.socket = sock
+        self.sock = self.socket.getsockname()
+        self.peer = self.socket.getpeername() if not host else self.sock
+        self.nick += self.addr
 
     @property
-    def addr(self):
-        return self.peer.__str__()
+    def connected(self) -> bool:
+        if self.socket is None:
+            return False
+        try:
+            self.socket.getsockname()
+        except socket.error:
+            return False
+        return True
+
+    @property
+    def addr(self) -> str:
+        return "_".join([str(x) for x in self.peer])
+
+    @property
+    def sock_addr(self) -> str:
+        return "_".join([str(x) for x in self.sock])
+
+    @property
+    def ip(self) -> str:
+        return self.peer[1]
+
+    @property
+    def sock_ip(self) -> str:
+        return self.sock[1]
+
+
+class Clients:
+    clients: list[User] = []
+
+    _name_to_client: dict[str, int] = {}
+    _addr_to_client: dict[str, int] = {}
+
+    @staticmethod
+    def by_name(name: str) -> User | None:
+        if name in Clients._name_to_client:
+            return Clients.clients[Clients._name_to_client[name]]
+
+    @staticmethod
+    def by_addr(addr: str) -> User | None:
+        if addr in Clients._addr_to_client:
+            return Clients.clients[Clients._addr_to_client[addr]]
+
+    @staticmethod
+    def add(client: User):
+        if client.nick in Clients._name_to_client:
+            client.nick += client.addr
+        Clients._name_to_client[client.nick] = len(Clients.clients)
+        Clients._addr_to_client[client.addr] = len(Clients.clients)
+        Clients.clients.append(client)
+
+    @staticmethod
+    def pop(client: User | str):
+        if isinstance(client, User):
+            Clients.clients.pop(Clients._addr_to_client[client.addr])
+            Clients._addr_to_client.pop(client.addr)
+            Clients._name_to_client.pop(client.nick)
+        elif isinstance(client, str):
+            index = Clients._name_to_client.get(client)
+            if index is None:
+                raise KeyError
+            client = Clients.clients[index]
+            Clients._addr_to_client.pop(client.addr)
+            Clients._name_to_client.pop(client.nick)
+            Clients.clients.pop(index)
+        else:
+            raise TypeError
+
+    @staticmethod
+    def close(client: User | str):
+        if isinstance(client, User):
+            client.socket.close()
+            Clients.pop(client)
+        elif isinstance(client, str):
+            c = Clients.by_name(client)
+            if c is None:
+                raise KeyError
+            Clients.pop(c)
 
 
 class Networking:
     def __init__(self):
-        self._socket: socket.socket | None = None
-        self._host: bool = False
-
-        self._connected: dict[str, User] = {}
-        self._local_ip: str = socket.gethostbyname(socket.gethostname())
-
-        self._aes_key: None = None
-        self._pub_key: rsa.PublicKey | None = None
-        self._pri_key: rsa.PrivateKey | None = None
-
-        self.rsa_key_size: int = 64
-        self.aes_key_size: int = 64
-
-        self.generate_new_rsa_keys(self.rsa_key_size)
-        self.generate_new_aes_key(self.aes_key_size)
-
+        self.socket: socket.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.user: User = User()
+        self.hosting: bool = False
+        self._ip = socket.gethostbyname(socket.gethostname())
 
-        self.ui_print_callback: Callable[[str, str], None] | None = None
+        self.ui_print: Callable[[str, str], None] | None = None
 
-    def generate_new_rsa_keys(self, size: int):
-        self._pub_key, self._pri_key = rsa.newkeys(size)
-        self.rsa_key_size = size
+    def assign_ui_callback(self, func: Callable[[str, str], None]):
+        self.ui_print = func
 
-    def generate_new_aes_key(self, size: int):
-        # TODO: aes
-        self.aes_key_size = size
-
-    def close_connection(self):
-        if not is_connected(self._socket):
-            return
-        if self._host:
-            for _, con in self._connected.items():
-                con.socket.close()
+    def close(self):
+        assert self.user.connected
+        if self.hosting:
+            for client in Clients.clients:
+                client.close()
         else:
-            self._socket.close()
-
-    def bind_server(self):
-        self._socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self._socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self._socket.bind((self._local_ip, PORT))
-        self._socket.listen(1)
-
-        self._host = True
-        self.user = User(self._socket)
-
-        self.ui_print_callback("[NET]", "Connection successful.")
-
-        while True:
-            con, _ = self._socket.accept()
-            user = User(con)
-            self._connected[user.addr] = user
-
-            th.Thread(target=self._request_handler, args=(user,), daemon=True).start()
-
-    def _request_handler(self, user: User):
-        self._on_join_server(user)
-
-        buffer: bytes = bytes()
-        while True:
-            try:
-                data = user.socket.recv(BUFFER_SIZE)
-            except socket.error:
-                self._connected.pop(user.addr)
-                user.socket.close()
-                self.ui_print_callback("[NET]", "Connection closed.")
-                break
-
-            if data[-len(TRANSFER_END):] == TRANSFER_END:
-                buffer += data[0:-len(TRANSFER_END)]
-                self._decode_packet(buffer)
-                self._broadcast_data(buffer + TRANSFER_END, {user.addr})
-                buffer = bytes()
-            else:
-                buffer += data
+            self.user.close()
 
     def connect_client(self, ip: str):
-        self._socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self._socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self._socket.connect((ip, PORT))
+        self.socket.connect((ip, PORT))
 
-        server = User(self._socket)
-        self._connected[server.peer.__repr__()] = server
-        self.user = server.__copy__()
+        self.user.assign_socket(self.socket)
+        Clients.add(self.user.__copy__())
+        self.user.nick = "user" + self.user.sock_addr
 
-        self.ui_print_callback("[NET]", "Connection successful.")
+        self.ui_print("[NET]", f"Connection successful! You are connected to {self.user.addr}")
 
         buffer: bytes = bytes()
         while True:
             try:
-                data = self._socket.recv(BUFFER_SIZE)
+                data = self.socket.recv(BUFFER_SIZE)
             except socket.error:
-                self._socket.close()
-                self.ui_print_callback("[NET]", "Connection closed.")
+                self.ui_print("NET", f"Connection closed for {Clients.by_addr(self.user.addr).nick} "
+                                     f"| {Clients.by_addr(self.user.addr).addr}")
+                self.socket.close()
                 break
 
-            if data[-len(TRANSFER_END):] == TRANSFER_END:
-                buffer += data[0:-len(TRANSFER_END)]
-                self._decode_packet(buffer)
+            if data[-len(TRANSFER_DELIMITER):] == TRANSFER_DELIMITER:
+                buffer += data[0:-len(TRANSFER_DELIMITER)]
+                # self._decode_packet(buffer)
                 buffer = bytes()
             else:
                 buffer += data
 
-    def _decode_packet(self, pack: bytes):
-        # print(pack)
+    def bind_server(self):
+        self.socket.bind((self._ip, PORT))
+        self.socket.listen(1)
 
-        dec = json.loads(pack.decode("ascii"))
-        if "data" in dec:
-            dec["data"] = base64.b64decode(dec["data"])
+        self.hosting = True
+        self.user.assign_socket(self.socket, self.hosting)
 
-        # print(dec)
-        # print(self._connected)
+        self.ui_print("[NET]", "Connection successful! You are the host")
 
-        if dec["addr"] not in self._connected:
-            self._connected[dec["addr"]] = User()
+        while True:
+            sock, _ = self.socket.accept()
+            client = User()
+            client.assign_socket(sock)
+            Clients.add(client)
 
-        match dec["type"]:
-            case "join":
-                pass
-            case "message":
-                self.ui_print_callback(self._connected[dec["addr"]].username, dec["data"].decode("utf-8"))
-            case "request":
-                if "username" in dec:
-                    self._connected[dec["addr"]].username = dec["username"]
-                if "rsa_key" in dec:
-                    self._connected[dec["addr"]].pub_key = rsa.PublicKey.load_pkcs1(dec["rsa_key"])
-                if "aes_key" in dec:
-                    pass
-            case _:
-                pass
+            th.Thread(target=self._request_handler, args=(client,), daemon=True).start()
 
-    def _generate_payload(self, type_: str, data: bytes | str | None = None, **kwargs) -> bytes:
-        packet = {
-            "type": type_,
-            "addr": self._socket.getsockname().__repr__()}
+    def _request_handler(self, client: User):
+        buffer: bytes = bytes()
+        while True:
+            try:
+                data = client.socket.recv(BUFFER_SIZE)
+            except socket.error:
+                self.ui_print("NET", f"Connection closed for {client.nick} | {client.addr}")
+                Clients.pop(client)
+                break
 
-        if data:
-            if isinstance(data, bytes):
-                d = base64.b64encode(data).decode('ascii')
+            if data[-len(TRANSFER_DELIMITER):] == TRANSFER_DELIMITER:
+                buffer += data[0:-len(TRANSFER_DELIMITER)]
+                # self._decode_packet(buffer)
+                # self._broadcast_data(buffer + TRANSFER_DELIMITER, {client})
+                buffer = bytes()
             else:
-                d = data
-            packet.update({"data": d})
+                buffer += data
 
-        packet.update(kwargs)
-        encrypted = json.dumps(packet).encode("ascii")
-        return encrypted + TRANSFER_END
-
-    def _broadcast_data(self, data: bytes, exceptions: set | None = None):
-        if exceptions is None:
-            exceptions = {}
-        if self._host:
-            for _, con in self._connected.items():
-                if con.addr not in exceptions:
-                    con.socket.send(data)
-        else:
-            self._socket.send(data)
-
-    def _on_join_server(self, user: User):
+    def send_message(self, text: str):
         pass
 
-    def change_username(self, new_username: str):
-        self.user.username = new_username
-        self._broadcast_data(
-            self._generate_payload(
-                type_="request",
-                username=new_username))
-
-    def send_message(self, message: str):
-        self._broadcast_data(
-            self._generate_payload(
-                type_="message",
-                data=message.encode("utf-8")))
+    def change_username(self, username: str):
+        pass
 
     @property
-    def get_local_ip(self):
-        return self._local_ip
+    def local_ip(self):
+        return self._ip
 
-    @property
-    def connections(self):
-        return self._connected
 
-    @property
-    def get_pub_key(self):
-        return self._pub_key
+def test():
+    net = Networking()
 
-    @property
-    def is_connected(self):
-        return is_connected(self._socket)
+
+if __name__ == '__main__':
+    test()

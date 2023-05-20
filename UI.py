@@ -54,7 +54,7 @@ class ConnectionTabView(ctk.CTkTabview, ABC):
         # adding entries and labels
         # ip address entry
         local_ip_ = ctk.CTkEntry(left_, width=40)
-        local_ip_.insert(0, self._net.get_local_ip)
+        local_ip_.insert(0, self._net.local_ip)
         local_ip_.pack(padx=4, pady=4, fill="x", anchor="n")
 
         local_ip_label_ = ctk.CTkLabel(right_, text="IP address of your local machine", anchor="w")
@@ -62,7 +62,7 @@ class ConnectionTabView(ctk.CTkTabview, ABC):
 
         # username
         username_ = ctk.CTkEntry(left_, width=40)
-        username_.insert(0, self._net.user.username)
+        username_.insert(0, self._net.user.nick)
         username_.pack(padx=4, pady=4, fill="x", anchor="n")
 
         username_label_ = ctk.CTkLabel(right_, text="Username that will be displayed", anchor="w")
@@ -90,7 +90,7 @@ class ConnectionTabView(ctk.CTkTabview, ABC):
         # adding entries and labels
         # key size
         key_size_ = ctk.CTkEntry(left_, width=40)
-        key_size_.insert(0, self._net.rsa_key_size.__str__())
+        key_size_.insert(0, self._net.user.rsa_size.__str__())
         key_size_.pack(padx=4, pady=4, fill="x", anchor="n")
 
         key_size_label_ = ctk.CTkLabel(right_, text="Current length of the RSA encryption key", anchor="w")
@@ -101,13 +101,13 @@ class ConnectionTabView(ctk.CTkTabview, ABC):
                                           dynamic_resizing=False)
         key_dropdown_.pack(padx=4, pady=4, fill="x", anchor="n")
 
-        def _regen_new_keys():
-            self._net.generate_new_rsa_keys(int(key_dropdown_.get()))
+        def _regen_new_rsa():
+            self._net.user.gen_new_rsa(int(key_dropdown_.get()))
             key_size_.delete(0, "end")
-            key_size_.insert(0, self._net.rsa_key_size)
+            key_size_.insert(0, self._net.user.rsa_size)
 
         key_regen_ = ctk.CTkButton(right_, text="regenerate RSA keys", width=80,
-                                   command=_regen_new_keys)
+                                   command=_regen_new_rsa)
         key_regen_.pack(padx=10, pady=4, anchor="nw")
 
         # regenerate AES key
@@ -115,7 +115,7 @@ class ConnectionTabView(ctk.CTkTabview, ABC):
                                               dynamic_resizing=False)
         aes_key_dropdown_.pack(padx=4, pady=4, fill="x", anchor="n")
 
-        def _regen_new_aes_keys():
+        def _regen_new_aes():
             pass
 
         key_regen_ = ctk.CTkButton(right_, text="regenerate AES key", width=80)
@@ -150,9 +150,10 @@ class ConnectionMenu(ctk.CTkToplevel):
 
 
 class ConnectMenu(ctk.CTkToplevel):
-    def __init__(self, net: networking.Networking, **kwargs):
+    def __init__(self, net: networking.Networking, ui, **kwargs):
         super(ConnectMenu, self).__init__(**kwargs)
         self._net = net
+        self._ui_print = ui
 
         # setup top level
         self.wm_title("Connection settings")
@@ -169,8 +170,8 @@ class ConnectMenu(ctk.CTkToplevel):
 
         # create host button
         def _host_button():
-            if self._net.is_connected:
-                self._net.ui_print_callback("[NET]", "You are already connected!")
+            if self._net.user.connected:
+                self._ui_print("[NET]", "You are already connected!")
                 return
 
             th.Thread(target=self._net.bind_server, daemon=True).start()
@@ -187,8 +188,8 @@ class ConnectMenu(ctk.CTkToplevel):
         ip_entry_.pack(padx=8, pady=8, anchor="n", fill="x")
 
         def _connect_to_button():
-            if self._net.is_connected:
-                self._net.ui_print_callback("[NET]", "You are already connected!")
+            if self._net.user.connected:
+                self._ui_print("[NET]", "You are already connected!")
                 return
 
             th.Thread(target=self._net.connect_client, args=(ip_entry_.get(),), daemon=True).start()
@@ -202,11 +203,11 @@ class ConnectMenu(ctk.CTkToplevel):
 
         # add disconnect button
         def _disconnect_button():
-            if not self._net.is_connected:
-                self._net.ui_print_callback("[NET]", "You are not connected to any server!")
+            if not self._net.user.connected:
+                self._ui_print("[NET]", "You are not connected to any server!")
                 return
 
-            self._net.close_connection()
+            self._net.close()
 
         disconnect_button_ = ctk.CTkButton(inner_, text="disconnect", command=_disconnect_button)
         disconnect_button_.pack(padx=8, pady=8, anchor="n", fill="x")
@@ -216,7 +217,7 @@ class UI:
     def __init__(self, net: Networking):
         self._win: ctk.CTk | None = None
         self._net: Networking = net
-        self._net.ui_print_callback = self.ui_print_callback
+        self._net.ui_print = self.ui_print
 
         self._chat: ctk.CTkTextbox | None = None
         self._chat_messages: list[ctk.CTkTabview] = []
@@ -226,13 +227,13 @@ class UI:
 
     def close(self):
         self._win.quit()
-        self._net.close_connection()
+        self._net.close()
 
     def open_connect(self):
-        ConnectMenu(self._net)
+        ConnectMenu(self._net, self.ui_print)
 
     def open_connection(self):
-        ConnectionMenu(self._net, self.ui_print_callback)
+        ConnectionMenu(self._net, self.ui_print)
 
     def open_settings(self):
         SettingsMenu(self._net)
@@ -277,11 +278,11 @@ class UI:
 
         def send_message(_):
             if chat_entry_.get():
-                if not self._net.is_connected:
-                    self.ui_print_callback("[NET]", "You must connect to the network first!")
+                if not self._net.user.connected:
+                    self.ui_print("[NET]", "You must connect to the network first!")
                     chat_entry_.delete(0, "end")
                     return
-                self.ui_print_callback(self._net.user.username, chat_entry_.get())
+                self.ui_print(self._net.user.nick, chat_entry_.get())
                 self._net.send_message(chat_entry_.get())
                 chat_entry_.delete(0, "end")
 
@@ -295,7 +296,7 @@ class UI:
         # start the UI
         self._win.mainloop()
 
-    def ui_print_callback(self, title: str, message: str):
+    def ui_print(self, title: str, message: str):
         msg_ = ctk.CTkTabview(self._chat, height=0)
         msg_.pack(padx=4, pady=2, fill="x", anchor="n")
 
